@@ -23,6 +23,8 @@
  */
 package org.kohsuke.metainf_services;
 
+import static java.lang.Integer.signum;
+
 import java.io.BufferedReader;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -33,6 +35,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.Filer;
 import javax.annotation.processing.RoundEnvironment;
@@ -57,6 +62,8 @@ import org.kohsuke.MetaInfServices;
 @SupportedAnnotationTypes("org.kohsuke.MetaInfServices")
 public class AnnotationProcessorImpl extends AbstractProcessor {
 
+    private static final Pattern PRIORITY_PATTERN = Pattern.compile("# priority (-?\\d+)");
+
     @Override public SourceVersion getSupportedSourceVersion() {
         try {
             // Seems to work. Probably could use some additional error checks, but current code does not even verify that the class is assignable to an explicitly specified type!
@@ -74,7 +81,7 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
         if (roundEnv.processingOver())      return false;
         // TODO should not write anything until processingOver
 
-        Map<String,Set<String>> services = new HashMap<String, Set<String>>();
+        Map<String,Map<String, Registration>> services = new HashMap<String, Map<String, Registration>>();
         
         Elements elements = processingEnv.getElementUtils();
 
@@ -88,23 +95,40 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
             if(contract==null)  continue; // error should have already been reported
 
             String cn = elements.getBinaryName(contract).toString();
-            Set<String> v = services.get(cn);
+            Map<String, Registration> v = services.get(cn);
             if(v==null)
-                services.put(cn,v=new TreeSet<String>());
-            v.add(elements.getBinaryName(type).toString());
+                services.put(cn,v=new HashMap<String, Registration>());
+            String name = elements.getBinaryName(type).toString();
+            v.put(name, new Registration(a.priority(), name));
         }
 
         // also load up any existing values, since this compilation may be partial
         Filer filer = processingEnv.getFiler();
-        for (Map.Entry<String,Set<String>> e : services.entrySet()) {
+        for (Map.Entry<String,Map<String, Registration>> e : services.entrySet()) {
             try {
                 String contract = e.getKey();
                 FileObject f = filer.getResource(StandardLocation.CLASS_OUTPUT, "", "META-INF/services/" +contract);
                 BufferedReader r = new BufferedReader(new InputStreamReader(f.openInputStream(), "UTF-8"));
-                String line;
-                while((line=r.readLine())!=null)
-                    e.getValue().add(line);
-                r.close();
+                try {
+                    String line;
+                    int currentPriority = 0;
+                    while ((line = r.readLine()) != null) {
+                        line = line.trim();
+                        final Matcher matcher = PRIORITY_PATTERN.matcher(line);
+                        if (matcher.matches()) {
+                            currentPriority = Integer.parseInt(matcher.group(1));
+                        }
+                        line = line.replaceAll("#.*", "").trim();
+                        if (!line.isEmpty()) {
+                            e.getValue().put(line, new Registration(currentPriority, line));
+                        }
+                    }
+                    r.close();
+                } finally {
+                    try {
+                        r.close();
+                    } catch (IOException ignored) {}
+                }
             } catch (FileNotFoundException x) {
                 // doesn't exist
             } catch (IOException x) {
@@ -113,14 +137,20 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
         }
 
         // now write them back out
-        for (Map.Entry<String,Set<String>> e : services.entrySet()) {
+        for (Map.Entry<String,Map<String, Registration>> e : services.entrySet()) {
             try {
                 String contract = e.getKey();
                 processingEnv.getMessager().printMessage(Kind.NOTE,"Writing META-INF/services/"+contract);
                 FileObject f = filer.createResource(StandardLocation.CLASS_OUTPUT, "", "META-INF/services/" +contract);
                 PrintWriter pw = new PrintWriter(new OutputStreamWriter(f.openOutputStream(), "UTF-8"));
-                for (String value : e.getValue())
-                    pw.println(value);
+                int currentPriority = 0;
+                for (Registration value : new TreeSet<Registration>(e.getValue().values())) {
+                    if (value.getPriority() != currentPriority) {
+                        currentPriority = value.getPriority();
+                        pw.printf("# priority %d%n", Integer.valueOf(currentPriority));
+                    }
+                    pw.println(value.getName());
+                }
                 pw.close();
             } catch (IOException x) {
                 processingEnv.getMessager().printMessage(Kind.ERROR,"Failed to write service definition files: "+x);
@@ -173,5 +203,29 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
 
     private void error(Element source, String msg) {
         processingEnv.getMessager().printMessage(Kind.ERROR,msg,source);
+    }
+
+    private static class Registration implements Comparable<Registration> {
+        private final String name;
+        private final int priority;
+
+        Registration(final int priority, final String name) {
+            this.priority = priority;
+            this.name = name;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public int getPriority() {
+            return priority;
+        }
+
+        public int compareTo(final Registration o) {
+            int res = signum(o.priority - priority);
+            if (res == 0) res = name.compareTo(o.name);
+            return res;
+        }
     }
 }
