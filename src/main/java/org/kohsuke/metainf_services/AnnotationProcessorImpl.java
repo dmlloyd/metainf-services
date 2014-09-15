@@ -43,13 +43,16 @@ import javax.annotation.processing.Filer;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.lang.model.SourceVersion;
+import javax.lang.model.element.AnnotationMirror;
+import javax.lang.model.element.AnnotationValue;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
-import javax.lang.model.type.MirroredTypeException;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
+import javax.lang.model.util.Types;
 import javax.tools.Diagnostic.Kind;
 import javax.tools.FileObject;
 import javax.tools.StandardLocation;
@@ -66,7 +69,7 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
 
     @Override public SourceVersion getSupportedSourceVersion() {
         try {
-            // Seems to work. Probably could use some additional error checks, but current code does not even verify that the class is assignable to an explicitly specified type!
+            // Seems to work.
             // Need to add unit tests. See stapler/stapler/core/src/test/java/org/kohsuke/stapler/jsr269/ for examples.
             return SourceVersion.valueOf("RELEASE_8");
         } catch (IllegalArgumentException x) {}
@@ -84,22 +87,64 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
         Map<String,Map<String, Registration>> services = new HashMap<String, Map<String, Registration>>();
         
         Elements elements = processingEnv.getElementUtils();
+        Types types = processingEnv.getTypeUtils();
+
+        TypeElement metaInfServicesTypeElement = elements.getTypeElement(MetaInfServices.class.getName());
+        TypeMirror metaInfServicesType = metaInfServicesTypeElement.asType();
 
         // discover services from the current compilation sources
-        for (Element e : roundEnv.getElementsAnnotatedWith(MetaInfServices.class)) {
-            MetaInfServices a = e.getAnnotation(MetaInfServices.class);
-            if(a==null) continue; // input is malformed, ignore
-            if (!e.getKind().isClass() && !e.getKind().isInterface()) continue; // ditto
-            TypeElement type = (TypeElement)e;
-            TypeElement contract = getContract(type, a);
-            if(contract==null)  continue; // error should have already been reported
-
-            String cn = elements.getBinaryName(contract).toString();
-            Map<String, Registration> v = services.get(cn);
-            if(v==null)
-                services.put(cn,v=new HashMap<String, Registration>());
-            String name = elements.getBinaryName(type).toString();
-            v.put(name, new Registration(a.priority(), name));
+        outer: for (Element e : roundEnv.getElementsAnnotatedWith(metaInfServicesTypeElement)) {
+            if (e.getKind().isClass() || e.getKind().isInterface()) {
+                TypeElement typeElement = (TypeElement) e;
+                String cn = null;
+                int priority = 0;
+                for (AnnotationMirror mirror : typeElement.getAnnotationMirrors()) {
+                    DeclaredType annotationType = mirror.getAnnotationType();
+                    if (types.isSameType(annotationType, metaInfServicesType)) {
+                        // found it
+                        for (Map.Entry<? extends ExecutableElement, ? extends AnnotationValue> entry : mirror.getElementValues().entrySet()) {
+                            String elementName = entry.getKey().getSimpleName().toString();
+                            AnnotationValue annotationValue = entry.getValue();
+                            if (elementName.equals("value")) {
+                                TypeMirror contractType = (TypeMirror) annotationValue.getValue();
+                                if (! (contractType instanceof DeclaredType)) {
+                                    processingEnv.getMessager().printMessage(Kind.ERROR, "Type '" + contractType + "' is a valid contract type", e, mirror, annotationValue);
+                                    continue outer;
+                                }
+                                if (! types.isAssignable(typeElement.asType(), contractType)) {
+                                    processingEnv.getMessager().printMessage(Kind.ERROR, "Type '" + typeElement.asType() + "' is not assignable to contract type '" + contractType + "'", e, mirror, annotationValue);
+                                    continue outer;
+                                }
+                                cn = ((TypeElement) ((DeclaredType) contractType).asElement()).getQualifiedName().toString();
+                            } else if (elementName.equals("priority")) {
+                                priority = ((Integer) annotationValue.getValue()).intValue();
+                            }
+                        }
+                        if (cn == null) {
+                            // try to infer it
+                            final TypeMirror superclass = typeElement.getSuperclass();
+                            boolean hasBaseClass = superclass.getKind()!=TypeKind.NONE && !isObject(superclass);
+                            boolean hasInterfaces = !typeElement.getInterfaces().isEmpty();
+                            if(hasBaseClass^hasInterfaces) {
+                                if(hasBaseClass)
+                                    cn = ((TypeElement)((DeclaredType)typeElement.getSuperclass()).asElement()).getQualifiedName().toString();
+                                else cn = ((TypeElement)((DeclaredType)typeElement.getInterfaces().get(0)).asElement()).getQualifiedName().toString();
+                            }
+                        }
+                        if (cn == null) {
+                            processingEnv.getMessager().printMessage(Kind.ERROR, "Cannot infer contract type for '" + typeElement + "'", typeElement, mirror);
+                            continue outer;
+                        }
+                        Map<String, Registration> v = services.get(cn);
+                        if(v==null)
+                            services.put(cn,v=new HashMap<String, Registration>());
+                        String name = elements.getBinaryName(typeElement).toString();
+                        v.put(name, new Registration(priority, name));
+                        // no need to look at more annotations
+                        break;
+                    }
+                }
+            }
         }
 
         // also load up any existing values, since this compilation may be partial
@@ -160,49 +205,12 @@ public class AnnotationProcessorImpl extends AbstractProcessor {
         return false;
     }
 
-    private TypeElement getContract(TypeElement type, MetaInfServices a) {
-        // explicitly specified?
-        try {
-            a.value();
-            throw new AssertionError();
-        } catch (MirroredTypeException e) {
-            TypeMirror m = e.getTypeMirror();
-            if (m.getKind()== TypeKind.VOID) {
-                // contract inferred from the signature
-                boolean hasBaseClass = type.getSuperclass().getKind()!=TypeKind.NONE && !isObject(type.getSuperclass());
-                boolean hasInterfaces = !type.getInterfaces().isEmpty();
-                if(hasBaseClass^hasInterfaces) {
-                    if(hasBaseClass)
-                        return (TypeElement)((DeclaredType)type.getSuperclass()).asElement();
-                    return (TypeElement)((DeclaredType)type.getInterfaces().get(0)).asElement();
-                }
-
-                error(type, "Contract type was not specified, but it couldn't be inferred.");
-                return null;
-            }
-
-            if (m instanceof DeclaredType) {
-                DeclaredType dt = (DeclaredType) m;
-                return (TypeElement)dt.asElement();
-            } else {
-                error(type, "Invalid type specified as the contract");
-                return null;
-            }
-        }
-
-
-    }
-
     private boolean isObject(TypeMirror t) {
         if (t instanceof DeclaredType) {
             DeclaredType dt = (DeclaredType) t;
             return((TypeElement)dt.asElement()).getQualifiedName().toString().equals("java.lang.Object");
         }
         return false;
-    }
-
-    private void error(Element source, String msg) {
-        processingEnv.getMessager().printMessage(Kind.ERROR,msg,source);
     }
 
     private static class Registration implements Comparable<Registration> {
